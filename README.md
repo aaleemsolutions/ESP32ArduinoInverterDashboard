@@ -1,4 +1,4 @@
-# Universal Voltronic / Ziewnic Inverter Web Gateway
+# Universal Voltronic / Inverter Web Gateway. All Pakistani Voltronic Based Inverters Supported (Inverex, Ziewnic, Fronus, XYZ) on 12,24,48 V Supported
 
 A lightweight, high-performance ESP32-powered serial-to-Wi-Fi bridging gateway designed explicitly for Voltronic, Axpert, and Ziewnic split-phase/hybrid inverters. This gateway acts as a standalone matrix conduit, transforming the inverter's proprietary 2400-baud RS-232 serial connection into a modern, real-time web dashboard and MQTT telemetry publisher.
 
