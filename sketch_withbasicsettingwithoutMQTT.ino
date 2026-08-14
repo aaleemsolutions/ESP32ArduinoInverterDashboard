@@ -8,6 +8,7 @@
 
 #define RXD2 16
 #define TXD2 17
+#define MAX_OUTAGES 30
 
 WebServer server(80);
 WiFiClient wifiClient;
@@ -34,12 +35,33 @@ struct Slot {
   bool enabled = false;
   int startMin = 0;
   int endMin = 0;
-  String mode = "NONE";    // NONE, UTILITY, SOLAR, SBU
-  String endMode = "NONE"; // Mode applied automatically when slot time expires
+  String mode = "NONE";    
+  String endMode = "NONE"; 
+};
+
+struct NightGuard {
+  bool enabled = false;
+  int startMin = 1140; 
+  int endMin = 360;    
+  String nightAmps = "MNCHGC020"; 
+  String dayAmps = "MNCHGC060";   
+};
+
+// === NEW: OUTAGE TRACKER CONFIG ===
+struct OutageEvent {
+  time_t start = 0;
+  time_t end = 0;
+  bool ongoing = false;
 };
 
 AppConfig cfg;
 Slot slots[4];
+NightGuard nightGuard;
+OutageEvent outages[MAX_OUTAGES];
+
+int outageHead = 0;
+int outageCount = 0;
+bool gridPresent = true; 
 
 String logBuffer = "";
 String lastQpigs = "";
@@ -48,12 +70,18 @@ String lastQmod = "";
 String lastQflag = "";
 String lastAppliedMode = "";
 String lastSchedulerAction = "None";
+String lastNightGuardState = "NONE";
 
 unsigned long lastPoll = 0;
 unsigned long lastMqttTry = 0;
 unsigned long lastScheduleCheck = 0;
 
-// Function declarations forward-references to prevent scoping issues
+bool quickTimerActive = false;
+unsigned long quickTimerStartTime = 0;
+unsigned long quickTimerDurationMs = 0;
+String modeBeforeTimer = "";
+String quickTimerMode = "";
+
 String executeRawHex(String hexString, uint16_t timeoutMs = 2200);
 void handleRawHex();
 
@@ -105,7 +133,6 @@ String executeCommand(String cmd, uint16_t timeoutMs = 2200) {
   cmd.trim();
   if (cmd.length() == 0) return "";
 
-  // === HARDCODED INTERCEPT BYPASS FOR SBU INSTUCTION MATRICES ===
   if (cmd == "POP02" || cmd == "SBU") {
     addLog("[SYSTEM] SBU detected. Redirecting directly to verified working raw hex sequence.");
     return executeRawHex("50 4F 50 30 32 E2 0B 0D", timeoutMs);
@@ -270,6 +297,12 @@ void loadConfig() {
     slots[i].endMode = prefs.getString((p + "em").c_str(), "NONE");
   }
 
+  nightGuard.enabled = prefs.getBool("ngEn", false);
+  nightGuard.startMin = prefs.getInt("ngSt", 1140);
+  nightGuard.endMin = prefs.getInt("ngEd", 360);
+  nightGuard.nightAmps = prefs.getString("ngNA", "MNCHGC020");
+  nightGuard.dayAmps = prefs.getString("ngDA", "MNCHGC060");
+
   prefs.end();
 }
 
@@ -298,6 +331,12 @@ void saveConfig() {
     prefs.putString((p + "em").c_str(), slots[i].endMode);
   }
 
+  prefs.putBool("ngEn", nightGuard.enabled);
+  prefs.putInt("ngSt", nightGuard.startMin);
+  prefs.putInt("ngEd", nightGuard.endMin);
+  prefs.putString("ngNA", nightGuard.nightAmps);
+  prefs.putString("ngDA", nightGuard.dayAmps);
+
   prefs.end();
 }
 
@@ -321,13 +360,33 @@ int timeToMin(String s) {
   return h * 60 + m;
 }
 
-bool checkSlotActiveStatus(Slot s, int nowMin) {
-  if (!s.enabled) return false;
+// === NEW: OUTAGE DATE/TIME HELPERS ===
+String formatTimeOutage(time_t t) {
+  if (t == 0) return "-";
+  struct tm *ti = localtime(&t);
+  char buf[30];
+  strftime(buf, sizeof(buf), "%I:%M %p (%b %d)", ti);
+  return String(buf);
+}
+
+String formatDurationOutage(time_t start, time_t end) {
+  long diff = (long)difftime(end, start);
+  int h = diff / 3600;
+  int m = (diff % 3600) / 60;
+  char buf[20];
+  if (h > 0) sprintf(buf, "%dh %dm", h, m);
+  else sprintf(buf, "%dm", m);
+  return String(buf);
+}
+
+bool slotActive(Slot s, int nowMin) {
+  if (!s.enabled || s.mode == "NONE") return false;
   if (s.startMin == s.endMin) return false;
 
   if (s.startMin < s.endMin) {
     return nowMin >= s.startMin && nowMin < s.endMin;
   }
+
   return nowMin >= s.startMin || nowMin < s.endMin;
 }
 
@@ -338,24 +397,68 @@ String commandForMode(String mode) {
   return "";
 }
 
-void checkScheduler() {
+void checkNightGuard() {
+  if (!nightGuard.enabled) return;
+
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
+
+  int nowMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  bool isNight = false;
+
+  if (nightGuard.startMin < nightGuard.endMin) {
+    isNight = (nowMin >= nightGuard.startMin && nowMin < nightGuard.endMin);
+  } else {
+    isNight = (nowMin >= nightGuard.startMin || nowMin < nightGuard.endMin);
+  }
+
+  String desiredState = isNight ? "NIGHT" : "DAY";
+  if (desiredState == lastNightGuardState) return;
+
+  String cmd = isNight ? nightGuard.nightAmps : nightGuard.dayAmps;
+  if (cmd != "") {
+    executeCommand(cmd, 2200);
+    addLog("🌙 Night Guard Shift: Applied " + cmd + " for " + desiredState + " mode.");
+  }
+  
+  lastNightGuardState = desiredState;
+}
+
+void checkQuickTimer() {
+  if (quickTimerActive) {
+    if (millis() - quickTimerStartTime >= quickTimerDurationMs) {
+      quickTimerActive = false;
+      addLog("Timer expired. Reverting to: " + modeBeforeTimer);
+      if (modeBeforeTimer != "" && modeBeforeTimer != "NONE") {
+        String cmd = commandForMode(modeBeforeTimer);
+        if (cmd != "") {
+          executeCommand(cmd, 2200);
+          lastAppliedMode = modeBeforeTimer;
+        }
+      }
+    }
+  }
+}
+
+void checkScheduler() {
+  if (quickTimerActive) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
   int nowMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
 
   String desiredMode = "NONE";
   bool insideActiveSlot = false;
 
-  // 1. Evaluate Active Window Allocations First
   for (int i = 0; i < 4; i++) {
-    if (checkSlotActiveStatus(slots[i], nowMin)) {
+    if (slotActive(slots[i], nowMin)) {
       desiredMode = slots[i].mode;
       insideActiveSlot = true;
       break;
     }
   }
 
-  // 2. If completely outside active windows, check if any slot just expired to apply an endMode
   if (!insideActiveSlot) {
     for (int i = 0; i < 4; i++) {
       if (slots[i].enabled && nowMin == slots[i].endMin && slots[i].endMode != "NONE") {
@@ -365,19 +468,21 @@ void checkScheduler() {
     }
   }
 
-  if (desiredMode == "NONE" || desiredMode == lastAppliedMode) return;
+  if (desiredMode == "NONE") return;
+  if (desiredMode == lastAppliedMode) return;
 
   String cmd = commandForMode(desiredMode);
   if (cmd.length() == 0) return;
 
   String resp = executeCommand(cmd, 2200);
-  lastSchedulerAction = minToTime(nowMin) + " -> " + desiredMode + " using " + cmd + " response " + resp;
 
-  if (resp.indexOf("ACK") >= 0 || resp.indexOf("ACK") >= 0) { // Safety hook for raw intercept strings
+  lastSchedulerAction = minToTime(nowMin) + " -> " + desiredMode;
+
+  if (resp.indexOf("ACK") >= 0 || resp.indexOf("ACK") >= 0) {
     lastAppliedMode = desiredMode;
-    addLog("Scheduler target executed cleanly: " + desiredMode);
+    addLog("Scheduler mode applied: " + desiredMode);
   } else {
-    addLog("Scheduler target failed: " + cmd + " resp=" + resp);
+    addLog("Scheduler command failed: " + cmd + " resp=" + resp);
   }
 }
 
@@ -397,13 +502,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 void reconnectMqtt() {
   if (cfg.mqttHost.length() == 0 || mqtt.connected()) return;
+
   mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1400);
+
   String clientId = "esp32-" + cfg.deviceId;
+
   bool ok = false;
   if (cfg.mqttUser.length() > 0) ok = mqtt.connect(clientId.c_str(), cfg.mqttUser.c_str(), cfg.mqttPass.c_str());
   else ok = mqtt.connect(clientId.c_str());
+
   if (ok) {
     addLog("MQTT connected");
     mqtt.subscribe((cfg.baseTopic + "/command/send").c_str());
@@ -414,7 +523,7 @@ void reconnectMqtt() {
 }
 
 String header(String title) {
-  String p = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  String p = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
   p += "<title>" + title + "</title><style>";
   p += "body{font-family:Arial;background:#eef2f3;margin:0;padding:12px;color:#263238}";
   p += ".box{max-width:1050px;margin:auto;background:#fff;padding:16px;border-radius:12px;box-shadow:0 3px 12px #0002}";
@@ -424,7 +533,8 @@ String header(String title) {
   p += ".k{font-size:12px;color:#607d8b}.v{font-size:22px;font-weight:bold}.console{background:#111;color:#00e676;padding:12px;height:310px;overflow:auto;white-space:pre-wrap;font-family:Consolas,monospace;font-size:13px;border-radius:8px}";
   p += "input,select,button{width:100%;padding:10px;margin-top:6px;box-sizing:border-box;font-size:15px}button{background:#1976d2;color:#fff;border:0;border-radius:6px;font-weight:bold}.red{background:#d32f2f}";
   p += "table{width:100%;border-collapse:collapse}td,th{border:1px solid #ddd;padding:8px;text-align:left}";
-  p += "</style></head><body><div class='box'><div class='nav'><a href='/'>Dashboard</a><a href='/settings'>Settings</a><a href='/scheduler'>Scheduler</a><a href='/gateway'>Gateway</a></div><h2>" + title + "</h2>";
+  p += "</style></head><body><div class='box'><div class='nav'>";
+  p += "<a href='/'>Dashboard</a><a href='/settings'>Settings</a><a href='/scheduler'>Scheduler</a><a href='/outages'>Outages</a><a href='/gateway'>Gateway</a></div><h2>" + title + "</h2>";
   return p;
 }
 
@@ -450,8 +560,11 @@ void handleRoot() {
   String t[35];
   int c = 0;
   splitTokens(lastQpigs, t, 35, c);
+
   String p = header("Live Inverter Dashboard");
+
   p += "<div class='sec'><button onclick=\"fetch('/refresh').then(()=>setTimeout(()=>location.reload(),800))\">Refresh Now</button></div>";
+
   p += "<div class='grid'>";
   p += card("Grid Voltage", c > 0 ? t[0] : "-", "V");
   p += card("Grid Frequency", c > 1 ? t[1] : "-", "Hz");
@@ -464,20 +577,47 @@ void handleRoot() {
   p += card("Charging Current", c > 11 ? t[11] : "-", "A");
   p += card("Current Mode", modeLabel(getToken(lastQmod, 0)), "");
   p += card("MQTT", mqtt.connected() ? "Connected" : "Off", "");
-  p += card("Scheduler", lastSchedulerAction, "");
+  
+  if (quickTimerActive) {
+    long remainMins = (quickTimerDurationMs - (millis() - quickTimerStartTime)) / 60000;
+    if (remainMins < 0) remainMins = 0;
+    p += card("Scheduler", "Paused (Timer: " + String(remainMins) + "m left)", "");
+  } else {
+    p += card("Scheduler", lastSchedulerAction, "");
+  }
   p += "</div>";
+
+  p += "<div class='sec'><h3>⏱️ Quick Override Timer</h3>";
+  if (quickTimerActive) {
+    long remainMins = (quickTimerDurationMs - (millis() - quickTimerStartTime)) / 60000;
+    if (remainMins < 0) remainMins = 0;
+    p += "<p><b>Status:</b> Forcing " + quickTimerMode + " mode.<br>Reverting to " + modeBeforeTimer + " in approx " + String(remainMins) + " minutes.</p>";
+    p += "<button class='red' onclick=\"fetch('/stop-timer').then(()=>setTimeout(()=>location.reload(),800))\">Cancel Timer & Revert Now</button>";
+  } else {
+    p += "<p style='font-size:13px; color:#607d8b; margin-top:0;'>Temporarily activate a mode. Automatically reverts to the previous mode.</p>";
+    p += "<div style='display:flex; gap:10px;'>";
+    p += "<input id='tMins' type='number' value='60' placeholder='Mins' style='width:30%;'>";
+    p += "<select id='tMode' style='width:40%; margin-top:6px; padding:10px;'><option value='SBU'>SBU</option><option value='UTILITY'>UTILITY</option><option value='SOLAR'>SOLAR</option></select>";
+    p += "<button style='width:30%;' onclick=\"fetch('/start-timer?mins='+document.getElementById('tMins').value+'&mode='+document.getElementById('tMode').value).then(()=>setTimeout(()=>location.reload(),800))\">Start Timer</button>";
+    p += "</div>";
+  }
+  p += "</div>";
+
   p += "<div class='sec'>";
   p += "<h3>Manual Command</h3>";
   p += "<input id='cmd' value='QPI'>";
   p += "<button onclick='sendCmd()'>Send With CRC + CR</button>";
   p += "</div>";
+
   p += "<div class='sec'>";
   p += "<h3>Raw Hex Command</h3>";
   p += "<input id='rawhex' value='50 4F 50 30 32 E2 0B 0D'>";
   p += "<button onclick='sendRawHex()'>Send Raw Hex</button>";
   p += "</div>";
+
   p += "<div class='sec'><h3>Live Log</h3><div class='console' id='log'>Loading...</div><button class='red' onclick='clearLog()'>Clear Log</button></div>";
   p += "<div class='sec'><h3>OTA Firmware Upload</h3><form method='POST' action='/ota' enctype='multipart/form-data'><input type='file' name='update' accept='.bin' required><button class='red'>Upload Firmware</button></form></div>";
+
   p += "<script>";
   p += "function load(){fetch('/log').then(r=>r.text()).then(t=>{let e=document.getElementById('log');e.innerText=t;e.scrollTop=e.scrollHeight;});}";
   p += "setInterval(load,1000);load();";
@@ -485,27 +625,170 @@ void handleRoot() {
   p += "function sendRawHex(){fetch('/rawhex?hex='+encodeURIComponent(document.getElementById('rawhex').value));}";
   p += "function clearLog(){fetch('/clear');}";
   p += "</script>";
+
   p += footer();
   server.send(200, "text/html", p);
+}
+
+// === NEW: OUTAGES PAGE ENDPOINT ===
+void handleOutagesPage() {
+  String p = header("Load Shedding Tracker");
+  
+  p += "<div class='sec'>";
+  p += "<h3>Grid Status: ";
+  if (gridPresent) p += "<span style='color:#10b981;'>ONLINE ⚡</span></h3>";
+  else p += "<span style='color:#d32f2f;'>OFFLINE ⚠️</span></h3>";
+  p += "<p style='font-size:13px; color:#607d8b;'>This page actively tracks and records grid outages (up to 30 events) to help you map load shedding durations.</p>";
+  p += "</div>";
+
+  p += "<div class='sec'>";
+  p += "<h3>Outage History</h3>";
+  p += "<table><tr><th>Grid Disconnected</th><th>Grid Restored</th><th>Total Duration</th></tr>";
+
+  if (outageCount == 0 && !outages[outageHead].ongoing) {
+    p += "<tr><td colspan='3'>No outages recorded in current session history.</td></tr>";
+  } else {
+    if (outages[outageHead].ongoing) {
+      time_t now; time(&now);
+      p += "<tr style='background:#ffebee; color:#d32f2f; font-weight:bold;'>";
+      p += "<td>" + formatTimeOutage(outages[outageHead].start) + "</td>";
+      p += "<td>ONGOING</td>";
+      p += "<td>" + formatDurationOutage(outages[outageHead].start, now) + "</td>";
+      p += "</tr>";
+    }
+    
+    int countToPrint = outageCount;
+    int idx = outageHead - 1;
+    while (countToPrint > 0) {
+      if (idx < 0) idx = MAX_OUTAGES - 1;
+      p += "<tr>";
+      p += "<td>" + formatTimeOutage(outages[idx].start) + "</td>";
+      p += "<td>" + formatTimeOutage(outages[idx].end) + "</td>";
+      p += "<td>" + formatDurationOutage(outages[idx].start, outages[idx].end) + "</td>";
+      p += "</tr>";
+      idx--;
+      countToPrint--;
+    }
+  }
+  
+  p += "</table></div>";
+  
+  p += footer();
+  server.send(200, "text/html", p);
+}
+
+void handleStartTimer() {
+  long mins = server.arg("mins").toInt();
+  String mode = server.arg("mode");
+  
+  if (mins > 0 && mode != "NONE" && mode != "") {
+    modeBeforeTimer = lastAppliedMode;
+    if (modeBeforeTimer == "") modeBeforeTimer = "UTILITY"; 
+    
+    quickTimerMode = mode;
+    quickTimerStartTime = millis();
+    quickTimerDurationMs = mins * 60000UL;
+    quickTimerActive = true;
+
+    String cmd = commandForMode(quickTimerMode);
+    executeCommand(cmd, 2200);
+    lastAppliedMode = quickTimerMode;
+    addLog("Timer started: Forced " + quickTimerMode + " for " + String(mins) + " mins.");
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStopTimer() {
+  if (quickTimerActive) {
+    quickTimerActive = false;
+    addLog("Timer cancelled manually. Reverting to: " + modeBeforeTimer);
+    if (modeBeforeTimer != "" && modeBeforeTimer != "NONE") {
+      String cmd = commandForMode(modeBeforeTimer);
+      if (cmd != "") {
+        executeCommand(cmd, 2200);
+        lastAppliedMode = modeBeforeTimer;
+      }
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSaveNightFix() {
+  nightGuard.enabled = server.arg("en") == "1";
+  nightGuard.startMin = timeToMin(server.arg("st"));
+  nightGuard.endMin = timeToMin(server.arg("ed"));
+  nightGuard.nightAmps = server.arg("nAmps");
+  nightGuard.dayAmps = server.arg("dAmps");
+  
+  saveConfig();
+  
+  lastNightGuardState = "FORCE_UPDATE"; 
+  server.send(200, "text/html", "<meta charset='utf-8'><h2>🌙 Night Guard Rules Saved!</h2><script>setTimeout(()=>window.location.href='/settings', 1200);</script>");
 }
 
 void handleSettingsPage() {
   String outPr = getToken(lastQpiri, 16);
   String chPr = getToken(lastQpiri, 17);
-  String p = header("Current Settings & Update");
+  String maxTotalAmps = getToken(lastQpiri, 11); 
+  String p = header("System Configuration");
+
   p += "<div class='sec'><button onclick=\"fetch('/refresh').then(()=>setTimeout(()=>location.reload(),800))\">Read Current Settings</button></div>";
+
   p += "<div class='grid'>";
-  p += card("Output Source Priority", sourcePriorityLabel(outPr));
-  p += card("Charger Source Priority", chargerPriorityLabel(chPr));
-  p += card("Raw QMOD", lastQmod);
+  p += card("Output Priority", sourcePriorityLabel(outPr));
+  p += card("Charger Priority", chargerPriorityLabel(chPr));
+  p += card("Total Charge Max", maxTotalAmps, "A");
   p += card("Raw QFLAG", lastQflag);
   p += "</div>";
+
+  p += "<form method='POST' action='/save-nightfix'>";
+  p += "<div class='sec' style='border-left: 5px solid #6366f1;'><h3>🌙 Phantom Solar Bug Fix (Night Guard)</h3>";
+  p += "<p style='font-size:12px; margin:0 0 10px 0;'>Ziewnic inverters often read fake solar voltage at night, keeping Total Charge Limit active instead of dropping to AC Grid Limit. This strictly forces the Total Charging Limit down at night to prevent massive grid drain, and restores it in the morning.</p>";
+  
+  p += "<table style='margin-bottom:10px;'><tr><th>Enable</th><th>Night Start</th><th>Morning Restore</th></tr>";
+  p += "<tr><td><select name='en'><option value='0'>Off</option><option value='1'" + String(nightGuard.enabled ? " selected" : "") + ">On</option></select></td>";
+  p += "<td><input name='st' value='" + minToTime(nightGuard.startMin) + "'></td>";
+  p += "<td><input name='ed' value='" + minToTime(nightGuard.endMin) + "'></td></tr></table>";
+
+  String ampVals[6] = {"MNCHGC010", "MNCHGC020", "MNCHGC030", "MNCHGC040", "MNCHGC050", "MNCHGC060"};
+  String ampLabels[6] = {"10A", "20A", "30A", "40A", "50A", "60A"};
+
+  p += "<label style='font-size:14px; font-weight:bold;'>Total Charge Limit at Night:</label>";
+  p += "<select name='nAmps' style='margin-bottom:10px;'>";
+  for (int i=0; i<6; i++) p += "<option value='" + ampVals[i] + "'" + String(nightGuard.nightAmps == ampVals[i] ? " selected" : "") + ">Force Total Limit to: " + ampLabels[i] + "</option>";
+  p += "</select>";
+
+  p += "<label style='font-size:14px; font-weight:bold;'>Restore Total Charge Limit in Day:</label>";
+  p += "<select name='dAmps' style='margin-bottom:10px;'>";
+  for (int i=0; i<6; i++) p += "<option value='" + ampVals[i] + "'" + String(nightGuard.dayAmps == ampVals[i] ? " selected" : "") + ">Restore Total Limit to: " + ampLabels[i] + "</option>";
+  p += "</select>";
+
+  p += "<button class='green'>Save Night Guard Rule</button>";
+  p += "</div></form>";
+
   p += "<div class='sec'><h3>Update Output Source Priority</h3>";
-  p += "<select id='sourceMode'><option value='UTILITY'>Utility First</option><option value='SOLAR'>Solar First</option><option value='SBU'>SBU First (Force Hex)</option></select>";
+  p += "<select id='sourceMode'><option value='UTILITY'>Utility First</option><option value='SOLAR'>Solar First</option><option value='SBU'>SBU First</option></select>";
   p += "<button onclick=\"fetch('/apply-source?mode='+document.getElementById('sourceMode').value).then(()=>setTimeout(()=>location.reload(),1000))\">Apply</button></div>";
+
   p += "<div class='sec'><h3>Update Charger Priority</h3>";
   p += "<select id='chargerMode'><option value='PCP00'>Utility First</option><option value='PCP01'>Solar First</option><option value='PCP02'>Solar + Utility</option><option value='PCP03'>Only Solar</option></select>";
   p += "<button onclick=\"fetch('/send-setting?cmd='+document.getElementById('chargerMode').value).then(()=>setTimeout(()=>location.reload(),1000))\">Apply</button></div>";
+
+  p += "<div class='sec'><h3>Max Utility (AC) Charging Current</h3>";
+  p += "<p style='font-size:12px; margin:0;'>Limit the load pulled from Grid when charging batteries.</p>";
+  p += "<select id='acChargeRate'><option value='MUCHGC002'>2A</option><option value='MUCHGC010'>10A</option><option value='MUCHGC020'>20A</option><option value='MUCHGC030'>30A</option></select>";
+  p += "<button onclick=\"fetch('/send-setting?cmd='+document.getElementById('acChargeRate').value).then(()=>setTimeout(()=>location.reload(),1000))\">Apply Limit</button></div>";
+
+  p += "<div class='sec'><h3>Back to Utility (Grid) Voltage</h3>";
+  p += "<p style='font-size:12px; margin:0;'>Example: 23.5 or 46.0</p>";
+  p += "<input id='vUtility' placeholder='Voltage' value='24.0'>";
+  p += "<button onclick=\"fetch('/send-setting?cmd=PBDV'+document.getElementById('vUtility').value).then(()=>setTimeout(()=>location.reload(),1000))\">Apply Voltage</button></div>";
+
+  p += "<div class='sec'><h3>Back to Battery (Discharge) Voltage</h3>";
+  p += "<p style='font-size:12px; margin:0;'>Example: 27.0 or 54.0</p>";
+  p += "<input id='vBattery' placeholder='Voltage' value='27.0'>";
+  p += "<button onclick=\"fetch('/send-setting?cmd=PBCV'+document.getElementById('vBattery').value).then(()=>setTimeout(()=>location.reload(),1000))\">Apply Voltage</button></div>";
+
   p += "<div class='sec'><h3>Flags</h3>";
   p += "<table><tr><th>Setting</th><th>Enable</th><th>Disable</th></tr>";
   p += "<tr><td>Buzzer silence/open buzzer</td><td><button onclick=\"send('PEA')\">Enable</button></td><td><button onclick=\"send('PDA')\">Disable</button></td></tr>";
@@ -513,24 +796,28 @@ void handleSettingsPage() {
   p += "<tr><td>Over-temperature restart</td><td><button onclick=\"send('PEV')\">Enable</button></td><td><button onclick=\"send('PDV')\">Disable</button></td></tr>";
   p += "<tr><td>Backlight</td><td><button onclick=\"send('PEX')\">Enable</button></td><td><button onclick=\"send('PDX')\">Disable</button></td></tr>";
   p += "</table></div>";
+
   p += "<script>function send(c){fetch('/send-setting?cmd='+c).then(()=>setTimeout(()=>location.reload(),1000));}</script>";
   p += footer();
+
   server.send(200, "text/html", p);
 }
 
 void handleSchedulerPage() {
   String p = header("Time Based Scheduler");
+
   p += "<div class='sec'><b>Current scheduler action:</b> " + h(lastSchedulerAction) + "<br>";
   p += "<b>Last applied mode:</b> " + h(lastAppliedMode) + "</div>";
+
   p += "<form method='POST' action='/save-scheduler'>";
   p += "<table><tr><th>Enable</th><th>Start</th><th>End</th><th>Active Mode</th><th>Time-Expired End Mode</th></tr>";
+
   for (int i = 0; i < 4; i++) {
     p += "<tr>";
     p += "<td><select name='en" + String(i) + "'><option value='0'>No</option><option value='1'" + String(slots[i].enabled ? " selected" : "") + ">Yes</option></select></td>";
     p += "<td><input name='st" + String(i) + "' value='" + minToTime(slots[i].startMin) + "'></td>";
     p += "<td><input name='ed" + String(i) + "' value='" + minToTime(slots[i].endMin) + "'></td>";
     
-    // Active Window Select drop-down
     p += "<td><select name='md" + String(i) + "'>";
     String modes[4] = {"NONE", "UTILITY", "SOLAR", "SBU"};
     for (int m = 0; m < 4; m++) {
@@ -538,7 +825,6 @@ void handleSchedulerPage() {
     }
     p += "</select></td>";
 
-    // NEW: Post-Window Expiration Fallback drop-down
     p += "<td><select name='em" + String(i) + "'>";
     for (int m = 0; m < 4; m++) {
       p += "<option value='" + modes[m] + "'" + String(slots[i].endMode == modes[m] ? " selected" : "") + ">" + modes[m] + "</option>";
@@ -547,14 +833,18 @@ void handleSchedulerPage() {
     
     p += "</tr>";
   }
+
   p += "</table><button>Save Scheduler</button></form>";
+
   p += "<div class='sec'><b>Example:</b><br>06:00-09:00 UTILITY (End Mode: SOLAR)<br>09:00-17:00 SOLAR (End Mode: SBU)</div>";
+
   p += footer();
   server.send(200, "text/html", p);
 }
 
 void handleGatewayPage() {
   String p = header("Gateway / MQTT Config");
+
   p += "<form method='POST' action='/save-gateway'>";
   p += "<div class='sec'><h3>MQTT</h3>";
   p += "Device ID:<input name='deviceId' value='" + h(cfg.deviceId) + "'>";
@@ -564,6 +854,7 @@ void handleGatewayPage() {
   p += "MQTT Password:<input name='mqttPass' type='password' value='" + h(cfg.mqttPass) + "'>";
   p += "Base Topic:<input name='baseTopic' value='" + h(cfg.baseTopic) + "'>";
   p += "</div>";
+
   p += "<div class='sec'><h3>Inverter / Commands</h3>";
   p += "Baud:<input name='baud' value='" + String(cfg.baudRate) + "'>";
   p += "Poll Interval ms:<input name='pollMs' value='" + String(cfg.pollMs) + "'>";
@@ -571,8 +862,10 @@ void handleGatewayPage() {
   p += "Solar Command:<input name='cmdSolar' value='" + h(cfg.cmdSolar) + "'>";
   p += "SBU Command:<input name='cmdSbu' value='" + h(cfg.cmdSbu) + "'>";
   p += "</div>";
+
   p += "<button>Save & Restart</button></form>";
   p += "<div class='sec'><a href='/reset-wifi'>Reset WiFi</a></div>";
+
   p += footer();
   server.send(200, "text/html", p);
 }
@@ -622,10 +915,10 @@ void handleSaveScheduler() {
     slots[i].startMin = timeToMin(server.arg("st" + String(i)));
     slots[i].endMin = timeToMin(server.arg("ed" + String(i)));
     slots[i].mode = server.arg("md" + String(i));
-    slots[i].endMode = server.arg("em" + String(i)); // Capture end-mode select parameters
+    slots[i].endMode = server.arg("em" + String(i)); 
   }
   saveConfig();
-  server.send(200, "text/html", "<h2>Scheduler configuration saved successfully.</h2><a href='/scheduler'>Back</a>");
+  server.send(200, "text/html", "<meta charset='utf-8'><h2>Scheduler saved.</h2><a href='/scheduler'>Back</a>");
 }
 
 void handleSaveGateway() {
@@ -648,7 +941,7 @@ void handleSaveGateway() {
 
   saveConfig();
 
-  server.send(200, "text/html", "<h2>Saved. Restarting...</h2>");
+  server.send(200, "text/html", "<meta charset='utf-8'><h2>Saved. Restarting...</h2>");
   delay(1200);
   ESP.restart();
 }
@@ -657,7 +950,7 @@ void handleLog() { server.send(200, "text/plain", logBuffer); }
 void handleClear() { logBuffer = ""; server.send(200, "text/plain", "OK"); }
 
 void handleResetWifi() {
-  server.send(200, "text/html", "<h2>Resetting WiFi...</h2>");
+  server.send(200, "text/html", "<meta charset='utf-8'><h2>Resetting WiFi...</h2>");
   delay(1000);
   WiFiManager wm;
   wm.resetSettings();
@@ -666,13 +959,14 @@ void handleResetWifi() {
 
 void handleOtaDone() {
   server.sendHeader("Connection", "close");
-  server.send(200, "text/html", Update.hasError() ? "OTA failed" : "<h2>OTA success. Rebooting...</h2>");
+  server.send(200, "text/html", Update.hasError() ? "OTA failed" : "<meta charset='utf-8'><h2>OTA success. Rebooting...</h2>");
   delay(1500);
   ESP.restart();
 }
 
 void handleOtaUpload() {
   HTTPUpload& upload = server.upload();
+
   if (upload.status == UPLOAD_FILE_START) {
     addLog("OTA upload started: " + upload.filename);
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -687,21 +981,29 @@ void handleOtaUpload() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
   loadConfig();
+
   Serial2.begin(cfg.baudRate, SERIAL_8N1, RXD2, TXD2);
+
   WiFiManager wm;
   bool connected = wm.autoConnect("ESP32-Inverter-Setup", "12345678");
   if (!connected) {
     delay(2000);
     ESP.restart();
   }
+
   configTime(5 * 3600, 0, "pool.ntp.org", "time.google.com");
+
   mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1400);
+
   server.on("/", handleRoot);
   server.on("/settings", handleSettingsPage);
+  server.on("/save-nightfix", HTTP_POST, handleSaveNightFix); 
   server.on("/scheduler", handleSchedulerPage);
+  server.on("/outages", handleOutagesPage); // === NEW: OUTAGES ROUTE ===
   server.on("/gateway", handleGatewayPage);
   server.on("/refresh", handleRefresh);
   server.on("/cmd", handleCmd);
@@ -714,17 +1016,24 @@ void setup() {
   server.on("/reset-wifi", handleResetWifi);
   server.on("/ota", HTTP_POST, handleOtaDone, handleOtaUpload);
   server.on("/rawhex", handleRawHex);
+  
+  server.on("/start-timer", handleStartTimer);
+  server.on("/stop-timer", handleStopTimer);
+
   server.begin();
+
   addLog("Gateway online");
   addLog("IP: http://" + WiFi.localIP().toString());
   addLog("UART RX=" + String(RXD2) + " TX=" + String(TXD2));
   addLog("Baud=" + String(cfg.baudRate));
   addLog("Voltronic/Axpert protocol active");
+
   refreshInverterCache();
 }
 
 void loop() {
   server.handleClient();
+
   if (cfg.mqttHost.length() > 0) {
     if (!mqtt.connected()) {
       if (millis() - lastMqttTry > 5000) {
@@ -735,19 +1044,58 @@ void loop() {
       mqtt.loop();
     }
   }
+
+  checkQuickTimer();
+
   if (millis() - lastPoll > cfg.pollMs) {
     lastPoll = millis();
     lastQpigs = executeCommand("QPIGS", 2200);
     lastQmod = executeCommand("QMOD", 1800);
+
+    // === NEW: OUTAGE TRACKING LOGIC (Passive Observer) ===
+    if (lastQpigs.length() > 10) {
+      String t[35];
+      int c = 0;
+      splitTokens(lastQpigs, t, 35, c);
+      if (c > 0) {
+        float gridV = t[0].toFloat();
+        bool currentGridState = (gridV > 50.0); // Safety threshold: >50V means Grid is ON
+        
+        static bool firstPollDone = false;
+        if (!firstPollDone) {
+          gridPresent = currentGridState;
+          firstPollDone = true;
+        } else {
+          if (gridPresent && !currentGridState) {
+            gridPresent = false;
+            time_t now; time(&now);
+            outages[outageHead].start = now;
+            outages[outageHead].ongoing = true;
+            addLog("⚠️ Grid offline. Load shedding started.");
+          } else if (!gridPresent && currentGridState) {
+            gridPresent = true;
+            time_t now; time(&now);
+            outages[outageHead].end = now;
+            outages[outageHead].ongoing = false;
+            outageHead = (outageHead + 1) % MAX_OUTAGES;
+            if (outageCount < MAX_OUTAGES) outageCount++;
+            addLog("⚡ Grid restored. Load shedding ended.");
+          }
+        }
+      }
+    }
+
     String telemetry = parseQpigsJson(lastQpigs);
     if (telemetry.length() > 0) {
       publishMqtt(cfg.baseTopic + "/telemetry", telemetry);
       publishMqtt(cfg.baseTopic + "/raw", lastQpigs);
     }
   }
+
   if (millis() - lastScheduleCheck > 30000) {
     lastScheduleCheck = millis();
     checkScheduler();
+    checkNightGuard(); 
   }
 }
 
